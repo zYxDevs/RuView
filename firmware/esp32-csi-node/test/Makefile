@@ -20,6 +20,11 @@
 #   FUZZ_JOBS=4               # Parallel fuzzing jobs
 
 CC       = clang
+# ADR-110: -DCONFIG_CSI_FRAME_HE_TAGGING=1 enables the byte-18/19 HE path
+# in csi_collector.c so the fuzzer exercises that code as well as the
+# legacy zero-fill path. CONFIG_SOC_WIFI_HE_SUPPORT is left UNSET to
+# exercise the legacy S3 branch (sig_mode/cwb/stbc). Add it to CFLAGS for
+# a parallel HE-stub build if you want fuzz coverage of the C6 branch.
 CFLAGS   = -fsanitize=fuzzer,address,undefined -g -O1 \
            -Istubs -I../main \
            -DCONFIG_CSI_NODE_ID=1 \
@@ -28,6 +33,7 @@ CFLAGS   = -fsanitize=fuzzer,address,undefined -g -O1 \
            -DCONFIG_CSI_TARGET_IP=\"192.168.1.1\" \
            -DCONFIG_CSI_TARGET_PORT=5500 \
            -DCONFIG_ESP_WIFI_CSI_ENABLED=1 \
+           -DCONFIG_CSI_FRAME_HE_TAGGING=1 \
            -Wno-unused-function
 
 STUBS_SRC = stubs/esp_stubs.c
