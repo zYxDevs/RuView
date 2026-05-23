@@ -9189,6 +9189,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq 2.12.1",
+ "wifi-densepose-hardware",
  "wifi-densepose-signal",
  "wifi-densepose-wifiscan",
 ]
