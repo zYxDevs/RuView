@@ -4056,6 +4056,72 @@ async fn sona_activate(
 }
 
 /// GET /api/v1/nodes — per-node health and feature info.
+/// ADR-110 iter 29 — per-node mesh sync snapshot via HTTP.
+///
+/// GET /api/v1/nodes/:id/sync
+///   200 → Json(NodeSyncSnapshot) when latest_sync is present
+///   404 → {"error": "no_sync", "node_id": N} otherwise
+///
+/// Complements the WebSocket `sync` field (iter 23) for clients that
+/// can't hold a streaming connection (curl scripts, Home Assistant REST
+/// sensors, automation rule probes).
+async fn node_sync_endpoint(
+    State(state): State<SharedState>,
+    Path(id): Path<u8>,
+) -> Result<Json<NodeSyncSnapshot>, (StatusCode, Json<serde_json::Value>)> {
+    let s = state.read().await;
+    let ns = s.node_states.get(&id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "unknown_node", "node_id": id,
+        })))
+    })?;
+    let sync = ns.latest_sync.as_ref().ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no_sync", "node_id": id,
+            "hint": "node hasn't emitted a sync packet yet (no mesh peer or not v0.6.9+)",
+        })))
+    })?;
+    Ok(Json(NodeSyncSnapshot {
+        offset_us: sync.local_minus_epoch_us(),
+        is_leader: sync.flags.is_leader,
+        is_valid: sync.flags.is_valid,
+        smoothed: sync.flags.smoothed_used,
+        sequence: sync.sequence,
+        csi_fps_ema: ns.csi_fps_ema,
+        csi_fps_samples: ns.csi_fps_samples,
+    }))
+}
+
+/// ADR-110 iter 29 — fleet-wide mesh state via HTTP.
+///
+/// GET /api/v1/mesh
+///   200 → { "nodes": { "<id>": NodeSyncSnapshot, ... }, "total": N }
+///   Nodes without a recent sync are omitted from the map; an empty
+///   `nodes` object means no mesh peers reachable.
+async fn mesh_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let mut nodes = serde_json::Map::new();
+    for (&id, ns) in s.node_states.iter() {
+        if let Some(sync) = ns.latest_sync.as_ref() {
+            let snap = NodeSyncSnapshot {
+                offset_us: sync.local_minus_epoch_us(),
+                is_leader: sync.flags.is_leader,
+                is_valid: sync.flags.is_valid,
+                smoothed: sync.flags.smoothed_used,
+                sequence: sync.sequence,
+                csi_fps_ema: ns.csi_fps_ema,
+                csi_fps_samples: ns.csi_fps_samples,
+            };
+            nodes.insert(id.to_string(), serde_json::to_value(snap).unwrap());
+        }
+    }
+    let total = nodes.len();
+    Json(serde_json::json!({
+        "nodes": serde_json::Value::Object(nodes),
+        "total": total,
+    }))
+}
+
 async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let now = std::time::Instant::now();
@@ -5566,6 +5632,9 @@ async fn main() {
         .route("/api/v1/sensing/latest", get(latest))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
+        // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
+        .route("/api/v1/nodes/:id/sync", get(node_sync_endpoint))
+        .route("/api/v1/mesh", get(mesh_endpoint))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
