@@ -18,6 +18,7 @@ pub mod host_validation;
 pub mod introspection;
 pub mod mqtt;
 pub mod path_safety;
+pub mod semantic;
 pub mod rvf_container;
 pub mod rvf_pipeline;
 pub mod sona;
