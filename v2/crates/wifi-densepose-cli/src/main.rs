@@ -21,6 +21,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Calibrate(args) => {
             wifi_densepose_cli::calibrate::execute(args).await?;
         }
+        Commands::CalibrateServe(args) => {
+            wifi_densepose_cli::calibrate_api::execute(args).await?;
+        }
         Commands::Mat(mat_cmd) => {
             wifi_densepose_cli::mat::execute(mat_cmd).await?;
         }

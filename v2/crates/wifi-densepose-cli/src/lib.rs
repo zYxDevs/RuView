@@ -27,6 +27,7 @@
 use clap::{Parser, Subcommand};
 
 pub mod calibrate;
+pub mod calibrate_api;
 pub mod mat;
 
 /// WiFi-DensePose Command Line Interface
@@ -51,6 +52,11 @@ pub enum Commands {
     /// Captures CSI frames via UDP and saves a per-subcarrier statistical
     /// baseline used for real-time motion z-scoring and CIR reference.
     Calibrate(calibrate::CalibrateArgs),
+
+    /// Run the calibration HTTP API (ADR-135/151) for a UI to drive.
+    /// Receives ESP32 CSI over UDP and exposes start/status/stop/result
+    /// endpoints at `/api/v1/calibration/*` (CORS-enabled).
+    CalibrateServe(calibrate_api::CalibrateServeArgs),
 
     /// Mass Casualty Assessment Tool commands
     #[command(subcommand)]

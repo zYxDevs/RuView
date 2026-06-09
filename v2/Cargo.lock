@@ -10817,6 +10817,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "axum",
  "chrono",
  "clap",
  "colored",
@@ -10832,6 +10833,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
