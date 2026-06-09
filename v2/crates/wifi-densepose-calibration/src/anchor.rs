@@ -20,7 +20,11 @@ pub enum Posture {
 }
 
 /// The fixed guided-anchor sequence (ADR-151 §2.2).
+///
+/// Serializes as snake_case (`empty`, `stand_still`, …) to match
+/// [`AnchorLabel::as_str`] and the documented JSON contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnchorLabel {
     /// Empty room reference (reuses the ADR-135 baseline).
     Empty,
@@ -282,6 +286,17 @@ mod tests {
             assert_eq!(AnchorLabel::from_str(l.as_str()), Some(l));
         }
         assert_eq!(AnchorLabel::from_str("nope"), None);
+    }
+
+    #[test]
+    fn label_serde_is_snake_case_matching_as_str() {
+        // The JSON wire format must equal as_str() (the documented contract).
+        for l in AnchorLabel::SEQUENCE {
+            let json = serde_json::to_string(&l).unwrap();
+            assert_eq!(json, format!("\"{}\"", l.as_str()));
+            let back: AnchorLabel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, l);
+        }
     }
 
     #[test]

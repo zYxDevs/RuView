@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::CorsLayer;
-use wifi_densepose_calibration::extract::Features;
+use wifi_densepose_calibration::extract::{AnchorFeature, Features};
 use wifi_densepose_calibration::{MixtureOfSpecialists, SpecialistBank};
 use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::{BaselineCalibration, CalibrationRecorder};
@@ -274,6 +274,7 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         .route("/api/v1/calibration/result", get(result))
         .route("/api/v1/calibration/baselines", get(baselines))
         .route("/api/v1/room/state", get(room_state))
+        .route("/api/v1/room/train", post(train_room))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -528,7 +529,8 @@ async fn descriptor() -> impl IntoResponse {
             "POST /api/v1/calibration/stop": "finalize current session early",
             "GET  /api/v1/calibration/result": "last finalized baseline summary",
             "GET  /api/v1/calibration/baselines": "list persisted baseline files",
-            "GET  /api/v1/room/state?bank=<name>": "live mixture-of-specialists RoomState over the CSI window"
+            "GET  /api/v1/room/state?bank=<name>": "live mixture-of-specialists RoomState over the CSI window",
+            "POST /api/v1/room/train": "{ room_id, baseline_id, anchors[] } → train + persist a specialist bank"
         }
     }))
 }
@@ -586,6 +588,47 @@ async fn result(State(st): State<ApiState>) -> impl IntoResponse {
         Some(r) => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"no finalized baseline yet"}))).into_response(),
     }
+}
+
+/// Body for `POST /api/v1/room/train` — an enrollment (CLI `enroll` output or
+/// any client that gathered labelled anchor features).
+#[derive(Deserialize)]
+struct TrainRequest {
+    room_id: String,
+    baseline_id: String,
+    #[serde(default)]
+    anchors: Vec<AnchorFeature>,
+}
+
+/// Train a per-room specialist bank from posted anchors and persist it as
+/// `<output_dir>/<room_id>.json` (the name `room-state` reads back).
+async fn train_room(State(st): State<ApiState>, Json(req): Json<TrainRequest>) -> impl IntoResponse {
+    if req.anchors.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no anchors in request"}))).into_response();
+    }
+    let at = (unix_ms() / 1000) as i64;
+    let bank = match SpecialistBank::train(&req.room_id, &req.baseline_id, &req.anchors, at) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("training failed: {e}")}))).into_response(),
+    };
+    let name = sanitize_room_id(&req.room_id);
+    let dir = { st.status.read().await.output_dir.clone() };
+    let path = format!("{dir}/{name}.json");
+    let json = match bank.to_json() {
+        Ok(j) => j,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("serialize: {e}")}))).into_response(),
+    };
+    if let Err(e) = tokio::fs::write(&path, json).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("cannot write {path}: {e}")}))).into_response();
+    }
+    let kinds: Vec<String> = bank.trained_kinds().iter().map(|k| format!("{k:?}")).collect();
+    (StatusCode::OK, Json(serde_json::json!({
+        "room_id": bank.room_id,
+        "bank": name,                  // pass as ?bank=<name> to /room/state
+        "anchor_count": bank.anchor_count,
+        "specialists": kinds,
+        "path": path,
+    }))).into_response()
 }
 
 /// Query for `GET /api/v1/room/state`.

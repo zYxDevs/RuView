@@ -88,7 +88,7 @@ UUID (`calibration_uuid()`) is the `baseline_id` referenced by enrollments and b
   "session": { "room_id": "...", "baseline_id": "...", "events": [ /* event-sourced audit log */ ] }
 }
 ```
-Anchor labels (fixed sequence): `empty, stand_still, sit, lie_down, breathe_slow, breathe_normal, small_move, sleep_posture`.
+Anchor labels (fixed sequence, **JSON wire = snake_case**, test-enforced): `empty, stand_still, sit, lie_down, breathe_slow, breathe_normal, small_move, sleep_posture`.
 
 ### 3.4 Specialist bank — JSON (`train-room` → `room-watch` / runtime)
 
@@ -136,6 +136,7 @@ Anchor labels (fixed sequence): `empty, stand_still, sit, lie_down, breathe_slow
 | GET | `/api/v1/calibration/result` | last finalized baseline summary |
 | GET | `/api/v1/calibration/baselines` | list persisted `.bin` baselines |
 | GET | `/api/v1/room/state?bank=<name>` | **live RoomState** (mixture-of-specialists over the CSI window; bank resolved as a sanitized name under `output_dir`) |
+| POST | `/api/v1/room/train` | `{ room_id, baseline_id, anchors[] }` → train + persist a specialist bank as `<output_dir>/<room_id>.json` (read back via `/room/state?bank=<room_id>`) |
 
 A single background task owns the UDP socket + recorder (handlers talk to it over an mpsc channel +
 shared status snapshot), so the API is non-blocking. Enrollment/train/room-state are CLI today
