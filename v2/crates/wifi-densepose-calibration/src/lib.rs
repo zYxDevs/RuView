@@ -25,11 +25,13 @@ pub mod extract;
 pub mod specialist;
 pub mod bank;
 pub mod runtime;
+pub mod multistatic;
 
 pub use anchor::{Anchor, AnchorLabel, AnchorQuality, EnrollmentEvent, EnrollmentSession, Posture};
 pub use bank::SpecialistBank;
 pub use enrollment::{AnchorQualityGate, AnchorRecorder};
 pub use error::{CalibrationError, Result};
 pub use extract::AnchorFeature;
+pub use multistatic::MultiNodeMixture;
 pub use runtime::{MixtureOfSpecialists, RoomState};
 pub use specialist::{Specialist, SpecialistKind, SpecialistReading};
