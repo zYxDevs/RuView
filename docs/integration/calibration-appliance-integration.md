@@ -212,9 +212,20 @@ exchange bank/model deltas, never raw CSI. Hardening already in place:
 
 ## 7. Status & validation
 
-- **Implemented:** all 5 stages + multistatic fusion; CLI + Stage-1 HTTP API. **54 tests** (35 calibration + 19 CLI).
-- **Hardware-validated** (ESP32-S3, COM8, `edge_tier=0`): baseline capture (120 frames → 52-subcarrier baseline); live parser → feature-extraction → mixture runtime detecting **breathing (~16–31 BPM)**; multistatic ingest grouping/fusing by `node_id`.
-- **Known follow-ups (carry into the appliance backlog):** phase-based (vs mean-amplitude) breathing carrier for higher SNR; RVF/HNSW persistence (currently JSON); enroll/train HTTP endpoints; the ADR-150 Hailo backbone; true 2-node multistatic on hardware; ADR-105 federation across appliances.
+- **Implemented:** all 5 stages + multistatic fusion; CLI + Stage-1 HTTP API (auth + path-traversal hardened). **54 tests** (35 calibration + 19 CLI), all passing under qemu-aarch64.
+
+**Precise validation matrix (don't overstate this — no clean full calibration has run on-target yet):**
+
+| Stage | Pi-5 (real nexmon→`0xC5110001`, 6,813 frames) | ESP32-S3 (COM8, `edge_tier=0`) | qemu / unit |
+|---|---|---|---|
+| baseline capture + HTTP API + **auth gate** | ✅ | ✅ (120-frame) | — |
+| **clean** empty-room baseline | ❌ `motion_flagged` (artifact) | ❌ (occupied) | — |
+| enroll → train-room | ❌ | ❌ (needs operator poses) | logic ✅ |
+| runtime infer | ❌ on-target | ◐ single-node breathing ~16–31 BPM via the **stateless** head (not a trained bank) + node-id fusion | veto/STALE/fusion ✅ |
+
+So capture + API + auth are proven on real CSI (both boxes); a **clean-baseline `enroll → train-room → room-watch`** loop is **not yet proven on-target** — that's the headline gap to close on the appliance.
+
+- **Known follow-ups (appliance backlog):** `--source-format adr018v6` to drive calibration from the Pi's own nexmon (no ESP32/transcoder); a clean empty-room enroll→train→infer on-target; phase-based (vs mean-amplitude) breathing carrier; RVF/HNSW persistence (currently JSON); enroll/train HTTP endpoints; ADR-150 Hailo backbone; true 2-node multistatic; ADR-105 federation.
 
 **Reference:** ADR-151 (`docs/adr/ADR-151-room-calibration-specialist-training.md`), ADR-135 (baseline),
 ADR-029 (multistatic), ADR-150 (RF Foundation Encoder), ADR-105 (federation), ADR-147 (OccWorld/Hailo).
