@@ -42,6 +42,7 @@ conservative floor, never the cap.
 | `simulator` | §21 M1 | deterministic ChaCha20 `frequency_response_curve(person, state, stimulus)` |
 | `optimizer` | §8 | Phase-1 calibration sweep, Phase-2 GP + Expected-Improvement, Phase-4 closed-loop control |
 | `bandit` | §8 P3 | LinUCB contextual bandit over envelope-safe arms |
+| `ruvector` | §10 items 3–6 | anonymized `ProfileStore` (one-way hashed tags), deterministic kNN, cohort warm-start priors (down-weighted pseudo-observations), `DriftDetector` over the physiological sub-vector, deterministic k-means clustering |
 | `session` | §11, §13 | hashable `SessionRecord`, reproducible `session_hash` (SHA-256, quantized canonical form) |
 | `ruflo` | §11 | consent → exclusion → envelope → run → monitor → score → update → witnessed audit; trial/sham mode; clinician export; claim discipline |
 | `proof` | — | deterministic bundle witness (mirrors `nvsim` / `verify.py`) |
@@ -91,10 +92,27 @@ the optimizer, simulator, response update, or session hashing.
 | `gamma_bandit_select` | ~74 ns | LinUCB decision |
 | `gamma_bayesian_recommend` | ~19 µs | GP + EI over the 0.1 Hz envelope grid (was ~105 µs: the GP is now factorized once per recommend, not once per grid candidate — −81%, bit-identical) |
 | `gamma_calibration_sweep` | ~135 µs | full 9-session enroll → simulate → score → update → witness (was ~486 µs, −71%) |
+| `gamma_cohort_knn_500` | ~15 µs | exact kNN over 500 anonymized profiles |
+| `gamma_cohort_warm_start_500` | ~16 µs | full cohort prior construction (runs once per enrollment) |
+
+## Self-learning across people (ADR-250 §10)
+
+`RufloGovernor::export_anonymized_profile()` publishes a participant's 20-field
+vector + per-frequency scores from **safe sessions only** under a one-way hashed
+tag; `seed_from_cohort(&store, k)` warm-starts a new person's optimizer from the
+k nearest responders as **down-weighted pseudo-observations**
+(`observe_prior`, ≥25× the real-observation noise). Priors shape where the
+optimizer looks first but never count as measured data — they are excluded from
+the EI incumbent, the audit log, and the clinician report. Per-session
+`drift_status()` (Welford centroid over the *physiological* sub-vector —
+stimulus inputs masked out) flags when recalibration is warranted.
 
 ## Roadmap (ADR-250 §21)
 
 M1 simulator ✅ · M2 device harness (envelope + e-stop contract) ✅ · M3 RuView
 state contract ✅ · M4 optional EEG input ✅ · M5 adaptive optimizer (BO + bandit
-+ closed-loop) ✅ · M6 trial mode (sham/blinding + clinician export) ✅. Hardware
-actuation, real RF sensing, and real EEG land behind feature-flagged adapters.
++ closed-loop) ✅ · M6 trial mode (sham/blinding + clinician export) ✅ ·
+§10 RuVector self-learning (cohort warm-start, drift detection, clustering) ✅.
+Hardware actuation, real RF sensing, and real EEG land behind feature-flagged
+adapters. An HNSW backend (the `ruvector` crates) drops in for `ProfileStore`
+once cohorts grow past ~10⁵ profiles.

@@ -75,6 +75,7 @@ pub mod optimizer;
 pub mod proof;
 pub mod response;
 pub mod ruflo;
+pub mod ruvector;
 pub mod safety;
 pub mod session;
 pub mod simulator;
@@ -101,8 +102,101 @@ pub use ruflo::PRODUCT_CLAIM;
 mod integration_tests {
     use crate::response::RuViewState;
     use crate::ruflo::{Consent, RufloGovernor, TrialMode};
+    use crate::ruvector::{DriftStatus, ProfileStore};
     use crate::simulator::{LatentPerson, ResponseSimulator};
     use crate::stimulus::{SafetyEnvelope, StimulusParameters};
+
+    /// ADR-250 §10 item 3 end-to-end: a cohort of calibrated responders with
+    /// similar physiology warm-starts a new person's optimizer — the very
+    /// first recommendation already points near the cohort's peak band instead
+    /// of the flat 40 Hz prior, while never counting as measured data
+    /// (`n_real_obs == 0`, `best() == None`).
+    #[test]
+    fn cohort_warm_start_improves_first_recommendation() {
+        let env = SafetyEnvelope::conservative();
+        let sim = ResponseSimulator::new(404);
+        let state = RuViewState::calm_baseline();
+
+        // Find a latent subject with a clearly detuned peak, then build a
+        // cohort of 3 donors with the *same* latent physiology (similar
+        // responders) who each ran a full calibration.
+        let mut chosen = None;
+        for n in 0..50 {
+            let id = format!("cohort-seed-{n}");
+            let p = LatentPerson::from_id(&id);
+            if (p.peak_hz - 40.0).abs() > 2.0 && p.peak_hz > 37.0 && p.peak_hz < 43.0 {
+                chosen = Some((id, p));
+                break;
+            }
+        }
+        let (seed_id, latent) = chosen.expect("a detuned subject exists");
+
+        let mut store = ProfileStore::new();
+        for d in 0..3 {
+            let donor_id = format!("{seed_id}-donor-{d}");
+            let mut donor =
+                RufloGovernor::enroll(&donor_id, env, &[], Consent::Granted).unwrap();
+            donor.run_calibration(&sim, &latent, &state, 5.0, 0).unwrap();
+            store.upsert(donor.export_anonymized_profile());
+        }
+
+        // New person, zero sessions: cold start recommends the 40 Hz prior...
+        let cold = RufloGovernor::enroll("newcomer", env, &[], Consent::Granted).unwrap();
+        let cold_rec = cold.recommend(&StimulusParameters::prior());
+        assert_eq!(cold_rec.stimulus.frequency_hz, 40.0);
+
+        // ...while a cohort-seeded start points into the cohort's peak band.
+        let mut warm = RufloGovernor::enroll("newcomer", env, &[], Consent::Granted).unwrap();
+        let n_priors = warm.seed_from_cohort(&store, 3);
+        assert!(n_priors > 0);
+        let warm_rec = warm.recommend(&StimulusParameters::prior());
+        assert!(env.contains(&warm_rec.stimulus));
+        let cold_err = (cold_rec.stimulus.frequency_hz - latent.peak_hz).abs();
+        let warm_err = (warm_rec.stimulus.frequency_hz - latent.peak_hz).abs();
+        assert!(
+            warm_err < cold_err,
+            "warm-start ({} Hz) should beat cold start ({} Hz) for peak {} Hz",
+            warm_rec.stimulus.frequency_hz,
+            cold_rec.stimulus.frequency_hz,
+            latent.peak_hz
+        );
+        // Honesty: priors are not measured data.
+        assert!(warm.audit_log().is_empty());
+        assert_eq!(warm.clinician_report().n_sessions, 0);
+    }
+
+    /// ADR-250 §10 item 4: a stable participant stays `Stable`; collapsing
+    /// their physiology (restless, uncomfortable, no entrainment) flags
+    /// `Drifted`, recommending recalibration.
+    #[test]
+    fn drift_is_flagged_when_response_collapses() {
+        let env = SafetyEnvelope::conservative();
+        let sim = ResponseSimulator::new(77);
+        let latent = LatentPerson::from_id("drift-subject");
+        let calm = RuViewState::calm_baseline();
+        let mut gov = RufloGovernor::enroll("drift-subject", env, &[], Consent::Granted).unwrap();
+
+        // Settle in: calibration sweep (9 sessions) → stable.
+        gov.run_calibration(&sim, &latent, &calm, 5.0, 0).unwrap();
+        assert_eq!(gov.drift_status(), DriftStatus::Stable);
+
+        // Physiology collapses: restless, fragmented breathing, low stillness.
+        let mut collapsed = calm;
+        collapsed.restlessness_score = 1.0;
+        collapsed.stillness_score = 0.0;
+        collapsed.breathing_stability = 0.1;
+        collapsed.motion_artifact = 0.9;
+        let stim = StimulusParameters::prior();
+        let mut drifted = false;
+        for i in 0..6 {
+            gov.run_session(&sim, &latent, &collapsed, &stim, 100 + i).unwrap();
+            if gov.drift_status() == DriftStatus::Drifted {
+                drifted = true;
+                break;
+            }
+        }
+        assert!(drifted, "collapsed physiology must flag drift");
+    }
 
     /// ADR-250 §18 acceptance: adaptive recommendation beats the fixed 40 Hz
     /// prior in mean simulated entrainment for a person whose peak is away

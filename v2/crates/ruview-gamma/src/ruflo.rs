@@ -10,6 +10,7 @@
 use crate::objective::{SafeEntrainmentObjective, ScoreInputs};
 use crate::optimizer::{BayesianOptimizer, CalibrationPlan, Recommendation};
 use crate::response::{PersonResponseVector, RuViewState, SessionObservation, SubjectiveReport};
+use crate::ruvector::{AnonymizedProfile, DriftDetector, DriftStatus, ProfileStore};
 use crate::safety::{
     ExclusionCondition, ExclusionScreen, SafetyMonitor, SafetyTick, ScreenOutcome, StopReason,
 };
@@ -76,6 +77,9 @@ pub struct RufloGovernor {
     confidence_floor: f64,
     audit: Vec<SessionRecord>,
     next_index: u64,
+    // ADR-250 §10 item 4: per-person drift detection over the response vector.
+    drift: DriftDetector,
+    drift_status: DriftStatus,
 }
 
 impl RufloGovernor {
@@ -109,7 +113,54 @@ impl RufloGovernor {
             envelope,
             audit: Vec::new(),
             next_index: 0,
+            drift: DriftDetector::default(),
+            drift_status: DriftStatus::Warmup,
         })
+    }
+
+    /// Seed the optimizer from a cohort of anonymized similar responders
+    /// (ADR-250 §10 item 3): the `k` nearest profiles' frequency responses
+    /// enter as **down-weighted pseudo-observations**, shaping where the
+    /// optimizer looks first without ever counting as this person's measured
+    /// data ([`BayesianOptimizer::observe_prior`]). Returns how many priors
+    /// were installed.
+    pub fn seed_from_cohort(&mut self, store: &ProfileStore, k: usize) -> usize {
+        let query = self.response.as_array();
+        let priors =
+            store.warm_start_prior(&query, k, self.optimizer.noise_var);
+        for p in &priors {
+            // Only frequencies inside this participant's envelope are usable.
+            if p.frequency_hz >= self.envelope.min_hz && p.frequency_hz <= self.envelope.max_hz {
+                self.optimizer
+                    .observe_prior(p.frequency_hz, p.expected_score, p.noise_var);
+            }
+        }
+        priors.len()
+    }
+
+    /// Export this participant as an anonymized profile for the cohort store
+    /// (ADR-250 §10 items 3/6). Carries the one-way hashed tag, the response
+    /// vector, and per-frequency scores from **safe sessions only** — never
+    /// the `person_id`, never raw sensor data.
+    pub fn export_anonymized_profile(&self) -> AnonymizedProfile {
+        let frequency_scores: Vec<(f64, f64)> = self
+            .audit
+            .iter()
+            .filter(|r| r.outcome.safety_pass)
+            .map(|r| (r.stimulus.frequency_hz, r.outcome.entrainment_score))
+            .collect();
+        AnonymizedProfile {
+            profile_tag: AnonymizedProfile::tag_for(&self.person_id),
+            vector: self.response.as_array(),
+            frequency_scores,
+        }
+    }
+
+    /// Latest drift judgment (ADR-250 §10 item 4). `Drifted` recommends
+    /// re-running the Phase-1 calibration sweep before trusting further
+    /// optimization.
+    pub fn drift_status(&self) -> DriftStatus {
+        self.drift_status
     }
 
     /// Switch trial mode (e.g., to `Sham` for a blinded arm).
@@ -219,7 +270,7 @@ impl RufloGovernor {
             self.optimizer.observe(stimulus.frequency_hz, score);
         }
 
-        // --- Update RuVector memory. ---
+        // --- Update RuVector memory + drift detection (ADR-250 §10 item 4). ---
         self.response.update(&SessionObservation {
             stimulus: *stimulus,
             ruview: resp.ruview,
@@ -228,6 +279,7 @@ impl RufloGovernor {
             safety_pass,
             adverse_event: resp.adverse_event,
         });
+        self.drift_status = self.drift.update(&self.response.as_array());
 
         // --- Recommend next frequency for the record. ---
         let next = self.optimizer.recommend(&self.envelope, stimulus);

@@ -188,6 +188,7 @@ outcomes; consumer deployment is safe without screening; 40 Hz is always optimal
 | M4 EEG validation (contract) | `response.rs` (`EegMeasurement`), `objective.rs` | **Optional input implemented** |
 | M5 Adaptive optimizer | `optimizer.rs` (Phase 1+2), `bandit.rs` (Phase 3), closed-loop | **Implemented** |
 | M6 Trial mode | `ruflo.rs` (consent, inclusion/exclusion, sham, audit, session hash) | **Implemented** |
+| §10 RuVector self-learning | `ruvector.rs` (anonymized `ProfileStore`, deterministic kNN, cohort warm-start priors via down-weighted GP pseudo-observations, physiological drift detection, deterministic clustering) | **Implemented** |
 
 The crate is a **deterministic, dependency-light leaf** (no internal RuView
 deps, ChaCha20 PRNG, SHA-256 witness — same discipline as `nvsim`), so the

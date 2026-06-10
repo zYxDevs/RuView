@@ -51,6 +51,13 @@ impl CalibrationPlan {
 
 /// Gaussian-process surrogate over the 1-D frequency axis with an
 /// Expected-Improvement acquisition (ADR-250 §8 Phase 2).
+///
+/// Supports two observation classes: **real** sessions from this person
+/// ([`observe`](Self::observe), noise `noise_var`) and **cohort priors** from
+/// anonymized similar responders ([`observe_prior`](Self::observe_prior),
+/// caller-supplied larger noise). Priors shape the posterior mean where the
+/// person has no data yet, but are honestly down-weighted and never define the
+/// EI incumbent — only the person's own sessions can do that.
 #[derive(Debug, Clone)]
 pub struct BayesianOptimizer {
     /// RBF length scale in Hz.
@@ -64,6 +71,10 @@ pub struct BayesianOptimizer {
     /// Observed `(frequency_hz, score)` pairs.
     obs_x: Vec<f64>,
     obs_y: Vec<f64>,
+    /// Per-observation noise variance (diagonal of the noise term in K).
+    obs_noise: Vec<f64>,
+    /// `true` for cohort pseudo-observations (excluded from the incumbent).
+    obs_prior: Vec<bool>,
 }
 
 impl Default for BayesianOptimizer {
@@ -75,26 +86,51 @@ impl Default for BayesianOptimizer {
             xi: 0.01,
             obs_x: Vec::new(),
             obs_y: Vec::new(),
+            obs_noise: Vec::new(),
+            obs_prior: Vec::new(),
         }
     }
 }
 
 impl BayesianOptimizer {
-    /// Record a calibration/optimization result.
+    /// Record a calibration/optimization result from a **real** session.
     pub fn observe(&mut self, frequency_hz: f64, score: f64) {
         self.obs_x.push(frequency_hz);
         self.obs_y.push(score);
+        self.obs_noise.push(self.noise_var);
+        self.obs_prior.push(false);
     }
 
-    /// Number of observations so far.
+    /// Record a **cohort prior** pseudo-observation (ADR-250 §10 item 3):
+    /// the expected score at `frequency_hz` inferred from anonymized similar
+    /// responders, with `noise_var` reflecting how little it is trusted
+    /// (must be ≥ the real-observation noise; clamped up if not).
+    pub fn observe_prior(&mut self, frequency_hz: f64, score: f64, noise_var: f64) {
+        self.obs_x.push(frequency_hz);
+        self.obs_y.push(score);
+        self.obs_noise.push(noise_var.max(self.noise_var));
+        self.obs_prior.push(true);
+    }
+
+    /// Number of observations so far (real + prior).
     pub fn n_obs(&self) -> usize {
         self.obs_x.len()
     }
 
-    /// Best observed score, or `None` if no observations.
+    /// Number of **real** (non-prior) observations.
+    pub fn n_real_obs(&self) -> usize {
+        self.obs_prior.iter().filter(|p| !**p).count()
+    }
+
+    /// Best **real** observed score, or `None` if no real observations.
+    /// Cohort priors are deliberately excluded: a borrowed expectation must
+    /// never masquerade as this person's measured response.
     pub fn best(&self) -> Option<(f64, f64)> {
         let mut best: Option<(f64, f64)> = None;
-        for (&x, &y) in self.obs_x.iter().zip(&self.obs_y) {
+        for ((&x, &y), &prior) in self.obs_x.iter().zip(&self.obs_y).zip(&self.obs_prior) {
+            if prior {
+                continue;
+            }
             if best.map(|(_, by)| y > by).unwrap_or(true) {
                 best = Some((x, y));
             }
@@ -102,10 +138,25 @@ impl BayesianOptimizer {
         best
     }
 
-    /// Factorize the GP once: Cholesky `L` of `K = RBF(X,X)+noise·I` and the
-    /// weight vector `alpha = K⁻¹ y`. Both depend only on the observations, not
-    /// on any query point, so a single fit serves the whole acquisition grid.
-    /// Returns `None` when there are no observations or `K` is not SPD.
+    /// EI incumbent: the best real observation, falling back to the best prior
+    /// when the person has no sessions yet (so cohort-seeded recommendation
+    /// still explores sensibly rather than treating 0 as the bar).
+    fn incumbent(&self) -> Option<f64> {
+        if let Some((_, by)) = self.best() {
+            return Some(by);
+        }
+        self.obs_y.iter().copied().fold(None, |acc, y| {
+            Some(match acc {
+                Some(a) if a >= y => a,
+                _ => y,
+            })
+        })
+    }
+
+    /// Factorize the GP once: Cholesky `L` of `K = RBF(X,X)+diag(noise)` and
+    /// the weight vector `alpha = K⁻¹ y`. Both depend only on the observations,
+    /// not on any query point, so a single fit serves the whole acquisition
+    /// grid. Returns `None` when there are no observations or `K` is not SPD.
     ///
     /// The per-query arithmetic in [`GpFit::predict`] is identical to the old
     /// inline path, so predictions (and therefore the session witness) are
@@ -115,7 +166,7 @@ impl BayesianOptimizer {
         if n == 0 {
             return None;
         }
-        // K (lower triangle is all Cholesky reads) = RBF(X,X) + noise·I.
+        // K (lower triangle is all Cholesky reads) = RBF(X,X) + diag(noise).
         let mut k = vec![0.0f64; n * n];
         for i in 0..n {
             for j in 0..=i {
@@ -126,7 +177,7 @@ impl BayesianOptimizer {
                     self.signal_var,
                 );
                 if i == j {
-                    v += self.noise_var;
+                    v += self.obs_noise[i];
                 }
                 k[i * n + j] = v;
             }
@@ -156,8 +207,8 @@ impl BayesianOptimizer {
 
     /// Expected Improvement (for maximization) at `x`.
     pub fn expected_improvement(&self, x: f64) -> f64 {
-        let best = match self.best() {
-            Some((_, by)) => by,
+        let best = match self.incumbent() {
+            Some(by) => by,
             None => return self.signal_var.sqrt(), // pure exploration
         };
         match self.fit() {
@@ -189,8 +240,8 @@ impl BayesianOptimizer {
                 };
             }
         };
-        // best() is Some here (fit exists ⇒ ≥1 observation).
-        let best = self.best().map(|(_, by)| by).unwrap_or(0.0);
+        // incumbent() is Some here (fit exists ⇒ ≥1 observation).
+        let best = self.incumbent().unwrap_or(0.0);
         let grid = fine_grid(envelope);
         let mut best_f = base.frequency_hz;
         let mut best_ei = f64::NEG_INFINITY;

@@ -11,6 +11,7 @@ use ruview_gamma::bandit::{BanditContext, ContextualBandit};
 use ruview_gamma::optimizer::BayesianOptimizer;
 use ruview_gamma::response::RuViewState;
 use ruview_gamma::ruflo::{Consent, RufloGovernor};
+use ruview_gamma::ruvector::{AnonymizedProfile, ProfileStore, VECTOR_DIM};
 use ruview_gamma::safety::{SafetyMonitor, SafetyTick};
 use ruview_gamma::simulator::{LatentPerson, ResponseSimulator};
 use ruview_gamma::stimulus::{SafetyEnvelope, StimulusParameters};
@@ -80,11 +81,40 @@ fn bench_bandit(c: &mut Criterion) {
     });
 }
 
+fn cohort_store(n: usize) -> ProfileStore {
+    let mut store = ProfileStore::new();
+    for i in 0..n {
+        let mut vector = [0.5; VECTOR_DIM];
+        vector[5] = 12.0 + (i % 8) as f64; // breathing_rate spread
+        vector[11] = 36.0 + (i % 9) as f64; // frequency spread
+        store.upsert(AnonymizedProfile {
+            profile_tag: format!("p{i:04}"),
+            vector,
+            frequency_scores: (36..=44).map(|f| (f as f64, 0.5 + 0.01 * (i % 7) as f64)).collect(),
+        });
+    }
+    store
+}
+
+fn bench_cohort_knn(c: &mut Criterion) {
+    let store = cohort_store(500);
+    let mut q = [0.5; VECTOR_DIM];
+    q[5] = 14.0;
+    q[11] = 39.0;
+    c.bench_function("gamma_cohort_knn_500", |b| {
+        b.iter(|| black_box(store.k_nearest(black_box(&q), 5)))
+    });
+    c.bench_function("gamma_cohort_warm_start_500", |b| {
+        b.iter(|| black_box(store.warm_start_prior(black_box(&q), 5, 1e-4)))
+    });
+}
+
 criterion_group!(
     benches,
     bench_calibration,
     bench_recommend,
     bench_safety_tick,
-    bench_bandit
+    bench_bandit,
+    bench_cohort_knn
 );
 criterion_main!(benches);
