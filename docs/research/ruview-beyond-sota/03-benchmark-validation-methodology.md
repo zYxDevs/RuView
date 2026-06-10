@@ -344,6 +344,33 @@ Anyone outside the project must be able to re-run every claimed result:
 
 ---
 
+## Update — falsifiable occupancy benchmark implemented
+
+`wifi-densepose-train::occupancy_bench` (added this branch) makes the
+presence/person-count claim **falsifiable in code**, directly enforcing the L3
+discipline above. It grades predictions vs ground truth and gates a SOTA claim
+behind a single `claim_allowed` invariant that requires **all** of:
+
+1. `DataProvenance::Measured` — synthetic/mock data is scorable for regression
+   but **never claimable** (anti-mock-contamination; the CLAUDE.md Kconfig-bug
+   lesson made structural).
+2. A leak-free `EvalSplit` — `validate()` refuses any split where a subject *or*
+   environment id appears in both train and test (subject leakage / per-env
+   overfitting).
+3. `n_test ≥ min_test_samples` (small-N guard).
+4. Presence F1 whose **bootstrap-CI lower bound** (deterministic splitmix64,
+   seeded) clears the threshold — not the point estimate.
+5. Count MAE within threshold.
+
+The claim string is unreadable except through the gate (returns `NO_CLAIM`
+otherwise) — same discipline as the `ruview-gamma` acceptance gate. 10 tests
+cover each refusal path. What remains is *data*, not *method*: feed it a frozen,
+SHA-pinned, subject/environment-disjoint **measured** replay set (the curated
+room-A/room-B item above) and the "beyond SOTA" claim becomes a passing or
+failing test, not a slogan.
+
+---
+
 *All values cited from: `benchmark_baseline.json`, `v2/crates/*/benches/*.rs` (15
 files), `docs/adr/ADR-147-benchmark-proof.md`,
 `docs/adr/ADR-149-swarm-benchmarking-evaluation-methodology.md`,
