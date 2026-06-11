@@ -246,6 +246,12 @@ impl StreamingEngine {
         self.recal = advisor;
     }
 
+    /// Mutable access to the mesh partition guard (risk threshold, quantum,
+    /// min-node count). Operators tune the partition-risk sensitivity here.
+    pub fn mesh_guard_mut(&mut self) -> &mut MeshGuard {
+        &mut self.mesh
+    }
+
     /// Default cap on live `SemanticState` beliefs in the WorldGraph
     /// (~6 minutes of full-rate history at 20 Hz; older beliefs are evicted —
     /// durable history belongs to the recorder).
@@ -439,13 +445,32 @@ impl StreamingEngine {
         // 4. Evolution change-point (ADR-142) over per-node mean amplitude.
         let change_point = self.track_evolution(node_frames, now_ms, room);
 
-        // 5. Privacy control plane (ADR-141): demote on a fusion-level OR an
-        //    array-level contradiction (monotonic — information only removed).
+        // 5. Mesh partition guard (ADR-032): dynamic min-cut over the coupling
+        //    graph. Coupling between nodes i and j is the product of their
+        //    fusion attention weights scaled by the node count, so a node the
+        //    fuser down-weights is exactly a node weakly coupled in the graph.
+        //    (Change-gated incremental updates: steady state touches 0 edges.)
+        let node_ids: Vec<u8> = node_frames.iter().map(|f| f.node_id).collect();
+        let weights = &quality.per_node_weights;
+        let n = weights.len() as f64;
+        let mesh = self.mesh.update(&node_ids, |i, j| {
+            let wi = weights.get(i).copied().unwrap_or(0.0) as f64;
+            let wj = weights.get(j).copied().unwrap_or(0.0) as f64;
+            wi * wj * n
+        });
+        let mesh_at_risk = mesh.as_ref().is_some_and(|m| m.at_risk);
+
+        // 6. Privacy control plane (ADR-141): demote on a fusion-level OR an
+        //    array-level contradiction OR a mesh close to partitioning. The
+        //    last is a security/reliability signal (ADR-032): a fragmenting
+        //    array makes the fused belief less trustworthy, so we emit at a
+        //    more restricted class. Monotonic — information is only ever
+        //    removed — and the demotion is part of the witness.
         let base_class = self.privacy.active_class();
-        let demoted = quality.forces_privacy_demotion() || array_contradiction;
+        let demoted = quality.forces_privacy_demotion() || array_contradiction || mesh_at_risk;
         let effective_class = if demoted { demote_one(base_class) } else { base_class };
 
-        // 6. Semantic state with mandatory provenance (ADR-139/140). The
+        // 7. Semantic state with mandatory provenance (ADR-139/140). The
         //    calibration version comes from the *agreed* epoch (None on mismatch).
         //    When a per-room adapter is active (ADR-150 §3.4) its content-derived
         //    id is part of model_version — and therefore of the witness — so the
@@ -480,23 +505,10 @@ impl StreamingEngine {
         // eviction; the just-added belief is always newest and survives.
         self.world.prune_semantic_states(self.semantic_retention);
 
-        // 7. Deterministic witness over the trust decision (ADR-137 §2.7).
+        // 8. Deterministic witness over the trust decision (ADR-137 §2.7).
+        //    `effective_class` already reflects any mesh-risk demotion, so a
+        //    fragmenting array shifts the witness — partition risk is auditable.
         let witness = witness_of(&provenance, effective_class);
-
-        // 8. Mesh partition guard: dynamic min-cut over the coupling graph.
-        //    Coupling between nodes i and j is the product of their fusion
-        //    attention weights scaled by the node count, so a node the fuser
-        //    down-weights is exactly a node weakly coupled in the graph.
-        //    (Change-gated incremental updates: steady state touches 0 edges.)
-        let node_ids: Vec<u8> = node_frames.iter().map(|f| f.node_id).collect();
-        let weights = &quality.per_node_weights;
-        let n = weights.len() as f64;
-        let mesh = self.mesh.update(&node_ids, |i, j| {
-            let wi = weights.get(i).copied().unwrap_or(0.0) as f64;
-            let wj = weights.get(j).copied().unwrap_or(0.0) as f64;
-            wi * wj * n
-        });
-        let mesh_at_risk = mesh.as_ref().is_some_and(|m| m.at_risk);
 
         // 9. Drift→recalibration advisor (ADR-135 → ADR-150 §3.4): sustained
         //    low coherence, an environment change-point, or a mesh close to
@@ -820,6 +832,40 @@ mod tests {
         }
         // Whatever the fuser decided, the report is internally consistent.
         assert!(m3.cut_value >= 0.0);
+    }
+
+    /// Mesh partition risk demotes the privacy class and shifts the witness —
+    /// a fragmenting array makes the fused belief less trustworthy, so it is
+    /// emitted at a more restricted class, and that demotion is auditable.
+    /// Synthetic injection (via a unit hook) so the test does not depend on the
+    /// fuser's exact weighting.
+    #[test]
+    fn mesh_risk_demotes_privacy_and_shifts_witness() {
+        let cal = CalibrationId(8);
+        let frames = [node_frame(0, 1000, 56), node_frame(1, 1001, 56)];
+
+        // Baseline: a clean 2-node cycle is not demoted (PrivateHome → Anonymous).
+        let (mut e1, r1) = engine();
+        let base = e1.process_cycle(&frames, cal, r1, 5_000).unwrap();
+        assert!(!base.demoted);
+        assert_eq!(base.effective_class, PrivacyClass::Anonymous);
+
+        // Force the mesh guard to report risk by setting an impossible risk
+        // threshold (any finite cut is ≤ it) on a ≥3-node mesh.
+        let (mut e2, r2) = engine();
+        e2.mesh_guard_mut().risk_threshold = f64::INFINITY;
+        let frames3 = [
+            node_frame(0, 1000, 56),
+            node_frame(1, 1001, 56),
+            node_frame(2, 1002, 56),
+        ];
+        let risky = e2.process_cycle(&frames3, cal, r2, 5_000).unwrap();
+        assert!(risky.mesh.as_ref().unwrap().at_risk);
+        assert!(risky.demoted, "mesh risk must demote");
+        // PrivateHome base Anonymous(2) → demoted to Restricted(3).
+        assert_eq!(risky.effective_class, PrivacyClass::Restricted);
+        assert!(risky.provenance.privacy_decision.contains("Restricted"));
+        assert_ne!(risky.witness, base.witness);
     }
 
     /// WorldGraph belief retention: the live loop appends one SemanticState per
