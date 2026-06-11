@@ -13,4 +13,6 @@ downloads/
 *.npz
 *.zip
 *.mat
+*.safetensors
+results/parity_fixture.json
 __pycache__/

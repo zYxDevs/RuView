@@ -3,8 +3,12 @@
 //! Idiomatic reimplementation of the DY2434 reference (Apache-2.0); see the
 //! [module docs](crate::wiflow_std) for provenance and the evidence grade.
 //! Weights are initialised from scratch (tch defaults; the axial-attention
-//! qkv conv mirrors the reference's `N(0, sqrt(1/in_planes))` init). Loading
-//! the retrained PyTorch checkpoint is a follow-up (key remap + `vs.load`).
+//! qkv conv mirrors the reference's `N(0, sqrt(1/in_planes))` init). The
+//! retrained PyTorch checkpoint loads via [`WiFlowStdModel::load`] after
+//! key-remapped safetensors export
+//! (`benchmarks/wiflow-std/export_to_safetensors.py`); numerical parity with
+//! the PyTorch forward pass is proven by
+//! `tests/test_wiflow_std_parity.rs` (max abs diff ~1.2e-7).
 
 use tch::{nn, Device, Tensor};
 
@@ -265,6 +269,25 @@ mod tests {
             bool::try_from(a.eq_tensor(&b).all()).unwrap(),
             "inference must be deterministic (dropout disabled)"
         );
+    }
+
+    /// Dumps the authoritative tch `VarStore` variable names + shapes. This is
+    /// the source of truth for the PyTorch→tch key mapping implemented in
+    /// `benchmarks/wiflow-std/export_to_safetensors.py` — rerun it (with
+    /// `--nocapture`) whenever the architecture changes.
+    #[test]
+    fn dump_variable_names() {
+        let cfg = WiFlowStdConfig::default();
+        let model = WiFlowStdModel::new(&cfg, Device::Cpu).expect("build");
+        let vars = model.var_store().variables();
+        let mut names: Vec<(String, Vec<i64>)> =
+            vars.iter().map(|(n, t)| (n.clone(), t.size())).collect();
+        names.sort();
+        for (name, shape) in &names {
+            println!("{name} {shape:?}");
+        }
+        println!("total: {} variables", names.len());
+        assert!(!names.is_empty());
     }
 
     #[test]
