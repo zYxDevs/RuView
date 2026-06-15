@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use homecore::{Context, EntityId, HomeCore, ServiceCall, ServiceError, ServiceName};
 use homecore::service::FnHandler;
-use homecore_api::{router, LongLivedTokenStore, SharedState};
+use homecore_api::{build_cors_layer, router, LongLivedTokenStore, SharedState};
 use homecore_assist::pipeline::default_pipeline;
 use homecore_assist::RegexIntentRecognizer;
 use homecore_automation::AutomationEngine;
@@ -37,6 +37,7 @@ use homecore_recorder::Recorder;
 
 use axum::Router;
 use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
 
 mod gateway;
 use gateway::{GatewayConfig, GatewayState};
@@ -221,7 +222,16 @@ async fn main() -> Result<()> {
             timeout: std::time::Duration::from_millis(cli.gateway_timeout_ms),
         },
     );
-    let app = build_app(api_state, &cli.ui_dir).merge(gateway::gateway_router(gw));
+    // Merge the HA-compat API + UI mount with the BFF gateway, THEN apply the
+    // audited CORS allowlist + request tracing to the WHOLE surface. The
+    // gateway routes (`/api/homecore/*`, `/api/cal/*`) are merged in outside
+    // `router()`'s own layers, so without this outer layer they would have NO
+    // CORS coverage and would not be traced (ADR-131 §11 review). Applying CORS
+    // again to the homecore-api routes is idempotent.
+    let app = build_app(api_state, &cli.ui_dir)
+        .merge(gateway::gateway_router(gw))
+        .layer(build_cors_layer())
+        .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
     info!("HOMECORE-API listening on http://{} (HA-compat /api + /api/websocket)", cli.bind);
     info!(
@@ -460,5 +470,61 @@ mod ui_tests {
         let app = build_app(test_state(), "");
         let (status, _) = get(app, "/homecore/").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "empty --ui-dir disables the mount");
+    }
+
+    /// Build the SAME merged + layered surface `main()` serves: API + UI mount
+    /// + BFF gateway, with the audited CORS allowlist + tracing applied to the
+    /// whole thing. Used to prove the gateway routes are CORS-covered.
+    fn full_app(state: SharedState) -> Router {
+        use crate::gateway::{GatewayConfig, GatewayState};
+        let gw = GatewayState::new(
+            state.clone(),
+            GatewayConfig {
+                calibration_url: None,
+                calibration_token: None,
+                apps_dir: std::path::PathBuf::from("/nonexistent-apps-dir"),
+                timeout: std::time::Duration::from_millis(200),
+            },
+        );
+        build_app(state, "")
+            .merge(crate::gateway::gateway_router(gw))
+            .layer(homecore_api::build_cors_layer())
+            .layer(TraceLayer::new_for_http())
+    }
+
+    #[tokio::test]
+    async fn gateway_routes_are_cors_covered_after_merge() {
+        // A CORS preflight from the Vite dev origin must succeed (echo the
+        // allowed origin) for a GATEWAY route — proving the outer CORS layer
+        // covers the merged routes, not just the homecore-api ones.
+        let app = full_app(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/homecore/appliance")
+                    .header("origin", "http://localhost:5173")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // CORS preflight handled by the layer → 2xx with the origin echoed back.
+        assert!(
+            resp.status().is_success(),
+            "gateway preflight should succeed, got {}",
+            resp.status()
+        );
+        let allow_origin = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            allow_origin, "http://localhost:5173",
+            "gateway route must echo the allowlisted dev origin"
+        );
     }
 }

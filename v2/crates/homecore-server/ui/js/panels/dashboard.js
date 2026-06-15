@@ -19,10 +19,10 @@ export default {
     await section(root, 'v0 Appliance health', async () => {
       const a = await api.appliance();
       const strip = h('.metric-grid',
-        metric({ icon: '🖥', value: a.cpu_pct + '%', label: 'CPU' }),
-        metric({ icon: '🧠', value: a.ram_pct + '%', label: 'RAM' }),
-        metric({ icon: '⚡', value: a.hailo_load_pct + '%', label: 'Hailo-10H load' }),
-        metric({ icon: '🌡', value: a.hailo_temp_c + '°C', label: 'Hailo temp' }),
+        metric({ icon: '🖥', value: pctOrNA(a.cpu_pct), label: 'CPU' }),
+        metric({ icon: '🧠', value: pctOrNA(a.ram_pct), label: 'RAM' }),
+        metric({ icon: '⚡', value: pctOrNA(a.hailo_load_pct), label: 'Hailo-10H load' }),
+        metric({ icon: '🌡', value: unitOrNA(a.hailo_temp_c, '°C'), label: 'Hailo temp' }),
         metric({ icon: '⏱', value: fmtUptime(a.uptime_s), label: 'Uptime', color: 'green' }));
       const healthCard = card({ title: 'v0 Appliance health', children: [strip, servicesRow(a.services)] });
       return h('div', healthCard, eventBus(a, ctx, (fn) => { cleanupEvent = fn; }));
@@ -135,7 +135,13 @@ function eventBus(a, ctx, setCleanup) {
   return card({ title: 'Event Bus activity', children: [body] });
 }
 
+// §6 honesty: a null/undefined metric must render a distinct not-available
+// state ('—'), never a fabricated value like "null%"/"null°C".
+function pctOrNA(v) { return v == null ? '—' : v + '%'; }
+function unitOrNA(v, unit) { return v == null ? '—' : v + unit; }
+
 function fmtUptime(s) {
+  if (s == null) return '—';
   const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600);
   return d > 0 ? `${d}d ${hh}h` : `${hh}h`;
 }

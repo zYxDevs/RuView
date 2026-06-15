@@ -10,7 +10,14 @@
 //
 // Gateway route map: ADR-131 §11.2.
 
-import * as mock from './mock.js';
+// DEV-ONLY fixtures. Loaded via DYNAMIC import so a production bundle that
+// never enters demo mode never pulls mock.js into the graph (§2.2). Cached
+// after first use so repeated demo calls don't re-import.
+let _mock = null;
+async function loadMock() {
+  if (!_mock) _mock = await import('./mock.js');
+  return _mock;
+}
 
 const demoFlags = {};
 
@@ -50,8 +57,10 @@ export const api = {
   },
 
   // demo-gated data accessor: real gateway GET in prod, mock fixture in demo.
+  // The mock module is dynamically imported ONLY on the demo branch, so prod
+  // never loads it. `mockFn` receives the loaded module.
   async _data(key, path, mockFn) {
-    if (demoMode()) { demoFlags[key] = true; return mockFn(); }
+    if (demoMode()) { demoFlags[key] = true; return mockFn(await loadMock()); }
     delete demoFlags[key];
     return this._get(path);
   },
@@ -68,28 +77,28 @@ export const api = {
   async setState(entityId, state, attributes) { return this._post(`/api/states/${entityId}`, { state, attributes: attributes || {} }); },
 
   // ── gateway /api/homecore/* + /api/events (§11.2) ─────────────────
-  async appliance() { return this._data('appliance', '/api/homecore/appliance', () => mock.applianceHealth()); },
-  async seeds() { return this._data('fleet', '/api/homecore/seeds', () => mock.seeds()); },
-  async seed(id) { return this._data('fleet', '/api/homecore/seeds/' + encodeURIComponent(id), () => mock.seed(id)); },
+  async appliance() { return this._data('appliance', '/api/homecore/appliance', (m) => m.applianceHealth()); },
+  async seeds() { return this._data('fleet', '/api/homecore/seeds', (m) => m.seeds()); },
+  async seed(id) { return this._data('fleet', '/api/homecore/seeds/' + encodeURIComponent(id), (m) => m.seed(id)); },
   async esp32Warnings() {
-    if (demoMode()) { demoFlags.fleet = true; return mock.esp32Warnings(); }
+    if (demoMode()) { demoFlags.fleet = true; return (await loadMock()).esp32Warnings(); }
     const seeds = await this._get('/api/homecore/seeds');
     return seeds.flatMap((s) => (s.warnings || []).map((issue) => ({ node_id: s.device_id, seed: s.device_id, issue })));
   },
-  async cogs() { return this._data('cogs', '/api/homecore/cogs', () => mock.cogs()); },
-  async cogUpdates() { return this._data('cogs', '/api/homecore/cogs/updates', () => mock.cogUpdates()); },
-  async hailo() { return this._data('cogs', '/api/homecore/hailo', () => ({ worker: 'connected', cogs: mock.cogs().filter((c) => c.arch === 'hailo10') })); },
-  async roomStates() { return this._data('rooms', '/api/homecore/rooms', () => mock.roomStates()); },
-  async federation() { return this._data('fleet', '/api/homecore/federation', () => mock.federation()); },
-  async witnessLog(page = 0, size = 12) { return this._data('audit', `/api/homecore/witness?page=${page}&size=${size}`, () => mock.witnessLog(page, size)); },
-  async privacyModes() { return this._data('audit', '/api/homecore/privacy', () => mock.privacyModes()); },
+  async cogs() { return this._data('cogs', '/api/homecore/cogs', (m) => m.cogs()); },
+  async cogUpdates() { return this._data('cogs', '/api/homecore/cogs/updates', (m) => m.cogUpdates()); },
+  async hailo() { return this._data('cogs', '/api/homecore/hailo', (m) => ({ worker: 'connected', cogs: m.cogs().filter((c) => c.arch === 'hailo10') })); },
+  async roomStates() { return this._data('rooms', '/api/homecore/rooms', (m) => m.roomStates()); },
+  async federation() { return this._data('fleet', '/api/homecore/federation', (m) => m.federation()); },
+  async witnessLog(page = 0, size = 12) { return this._data('audit', `/api/homecore/witness?page=${page}&size=${size}`, (m) => m.witnessLog(page, size)); },
+  async privacyModes() { return this._data('audit', '/api/homecore/privacy', (m) => m.privacyModes()); },
   async setPrivacy(seed, modeValue) { if (demoMode()) return { seed, mode: modeValue }; return this._post('/api/homecore/privacy', { seed, mode: modeValue }); },
-  async eventHistory(n = 40) { return this._data('events', `/api/events?limit=${n}`, () => mock.recentEvents(n)); },
+  async eventHistory(n = 40) { return this._data('events', `/api/events?limit=${n}`, (m) => m.recentEvents(n)); },
   recentEvents(n) { return this.eventHistory(n); }, // back-compat alias (async)
-  async settings() { return this._data('settings', '/api/homecore/settings', () => mock.settings()); },
+  async settings() { return this._data('settings', '/api/homecore/settings', (m) => m.settings()); },
   async automations() { return this._data('automations', '/api/homecore/automations', () => []); },
   async saveAutomation(a) { if (demoMode()) return a; return this._post('/api/homecore/automations', a); },
-  async tokens() { return this._data('settings', '/api/homecore/tokens', () => mock.settings().tokens); },
+  async tokens() { return this._data('settings', '/api/homecore/tokens', (m) => m.settings().tokens); },
 
   // calibration (ADR-151) — real proxy in prod, simulated in demo.
   calibration: makeCalibration(),
@@ -123,8 +132,12 @@ export function entityProvenance(entity) {
   const nodeMatch = src.match(/esp32[-\w]*/i);
   const node = attrs.node || (nodeMatch ? nodeMatch[0] : null);
   let seed = attrs.seed || null;
-  if (!seed && demoMode() && node) {
-    const cfg = mock.settings().esp32.find((n) => n.node_id === node);
+  // Demo-only enrichment: consult the mock node registry IF it has already
+  // been dynamically loaded by a prior demo data call (this fn is sync, so it
+  // cannot await the import). Prod never has `_mock` set → seed stays null
+  // (never fabricated).
+  if (!seed && demoMode() && node && _mock) {
+    const cfg = _mock.settings().esp32.find((n) => n.node_id === node);
     seed = cfg ? cfg.seed : null;
   }
   const hailo = /hailo|pose/i.test(src) || /hailo/i.test(String(attrs.cog || ''));

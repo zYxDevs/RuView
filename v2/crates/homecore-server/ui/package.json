@@ -6,7 +6,7 @@
   "description": "HOMECORE-UI — operational dashboard for the two-tier Cognitum stack (ADR-131). Zero-dependency vanilla TS/JS + CSS; served by homecore-server at /homecore.",
   "scripts": {
     "check": "node tests/verify-imports.mjs",
-    "test": "node tests/verify-imports.mjs && node tests/boot.mjs && node tests/render-smoke.mjs && node tests/interaction.mjs && node tests/prod-errors.mjs",
+    "test": "node tests/verify-imports.mjs && node tests/boot.mjs && node tests/render-smoke.mjs && node tests/interaction.mjs && node tests/prod-errors.mjs && node tests/unit-fixes.mjs",
     "bench": "node tests/benchmark.mjs"
   }
 }

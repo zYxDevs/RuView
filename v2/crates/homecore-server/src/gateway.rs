@@ -111,6 +111,82 @@ fn upstream_unavailable(detail: &str) -> Response {
 fn upstream_timeout(detail: &str) -> Response {
     typed(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", detail)
 }
+fn bad_request(detail: &str) -> Response {
+    typed(StatusCode::BAD_REQUEST, "bad_request", detail)
+}
+
+/// Reject a proxied wildcard path that could escape the `/api/` scope on the
+/// upstream calibration service (path-traversal / confused-deputy SSRF —
+/// ADR-131 §11 security review). The privileged server-side calibration bearer
+/// is attached by `proxy()`, so a client must NOT be able to redirect that
+/// credential outside `…/api/`.
+///
+/// Returns `Err(400)` when the path (or its percent-decoded form):
+///   * is absolute (`/…`) — would replace the `…/api/` base entirely,
+///   * contains a backslash (`\`) — Windows/alt-separator traversal,
+///   * has any segment equal to `.` or `..` — dot-segment traversal,
+///   * still carries `%2e%2e` / `%2f` (single-decode is enough — we reject on
+///     the decoded form AND on a residual encoded marker, so double-encoding
+///     like `%252e` decodes once to `%2e` and is caught here).
+///
+/// Legitimate `v1/...` paths (the only shape the UI sends) pass unchanged.
+fn validate_proxy_path(path: &str) -> Result<(), Response> {
+    // 1. Reject on the raw form first (cheap; catches backslash + leading `/`).
+    if path.starts_with('/') {
+        return Err(bad_request("proxied path must be relative (leading '/' not allowed)"));
+    }
+    if path.contains('\\') {
+        return Err(bad_request("proxied path must not contain a backslash"));
+    }
+    // 2. Percent-decode once and re-check; reject if decoding is invalid.
+    let decoded = percent_decode_once(path)
+        .ok_or_else(|| bad_request("proxied path has invalid percent-encoding"))?;
+    if decoded.starts_with('/') || decoded.contains('\\') {
+        return Err(bad_request("proxied path resolves to an absolute/traversal path"));
+    }
+    // 3. Reject any `.`/`..` segment on BOTH the raw and decoded forms so an
+    //    encoded `%2e%2e%2f` cannot slip a dot-segment past the split.
+    for form in [path, decoded.as_str()] {
+        for seg in form.split(['/', '\\']) {
+            if seg == "." || seg == ".." {
+                return Err(bad_request("proxied path must not contain '.' or '..' segments"));
+            }
+        }
+        // Defence in depth: a residual encoded traversal marker survived the
+        // single decode (e.g. originally double-encoded). Reject it outright.
+        let lower = form.to_ascii_lowercase();
+        if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
+            return Err(bad_request("proxied path must not contain encoded traversal markers"));
+        }
+    }
+    Ok(())
+}
+
+/// Minimal single-pass percent-decoder (no external dep). Returns `None` on a
+/// malformed escape so callers can fail closed.
+fn percent_decode_once(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = (bytes[i + 1] as char).to_digit(16)?;
+                let lo = (bytes[i + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
 
 /// Routes whose upstream is a SEED device / appliance daemon not present
 /// in this repo. Honest 503 until the corresponding §12 wave lands.
@@ -140,6 +216,9 @@ async fn cal_proxy_get(
     if let Err(r) = require_auth(&headers, &st).await {
         return r;
     }
+    if let Err(r) = validate_proxy_path(&path) {
+        return r;
+    }
     let base = match &st.cfg.calibration_url {
         Some(u) => u,
         None => return upstream_unavailable("calibration service not configured (set --calibration-url / HOMECORE_CALIBRATION_URL)"),
@@ -158,6 +237,9 @@ async fn cal_proxy_post(
     body: Bytes,
 ) -> Response {
     if let Err(r) = require_auth(&headers, &st).await {
+        return r;
+    }
+    if let Err(r) = validate_proxy_path(&path) {
         return r;
     }
     let base = match &st.cfg.calibration_url {
@@ -235,13 +317,22 @@ async fn rooms(State(st): State<GatewayState>, headers: HeaderMap) -> Response {
         Ok(v) => bank_names(&v),
         Err(r) => return r,
     };
-    let mut out: Vec<Value> = Vec::new();
-    for bank in banks {
-        let url = format!("{base}/api/v1/room/state?bank={bank}");
-        if let Ok(v) = fetch_json(&st, &url).await {
-            out.push(adapt_room_state(&bank, &v));
+    // Fetch every bank's RoomState concurrently (§11 perf): one slow bank no
+    // longer serialises behind the others. Order is preserved by collecting in
+    // the original bank order.
+    let fetches = banks.into_iter().map(|bank| {
+        let st = &st;
+        let base = base.as_str();
+        async move {
+            let url = format!("{base}/api/v1/room/state?bank={bank}");
+            fetch_json(st, &url).await.ok().map(|v| adapt_room_state(&bank, &v))
         }
-    }
+    });
+    let out: Vec<Value> = futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     Json(out).into_response()
 }
 
@@ -296,7 +387,11 @@ fn adapt_room_state(bank: &str, v: &Value) -> Value {
         Some(r) if !r.is_null() => json!({
             "value": r.get("value").cloned().unwrap_or(Value::Null),
             "confidence": r.get("confidence").cloned().unwrap_or(Value::Null),
-            "threshold": 0.5,
+            // §6 invariant 3 (honesty): pass through the REAL anomaly threshold
+            // from the upstream RoomState if present; if absent, emit null
+            // (withheld) — never fabricate a constant. The UI treats null as
+            // withheld, not a fake default.
+            "threshold": r.get("threshold").cloned().unwrap_or(Value::Null),
         }),
         _ => Value::Null,
     };
@@ -387,17 +482,24 @@ async fn appliance(State(st): State<GatewayState>, headers: HeaderMap) -> Respon
     let ram = mem_used_pct();
     let cpu = cpu_load_pct();
     let uptime = uptime_secs();
-    let services: Vec<Value> = [
+    // Probe the appliance services concurrently with a non-blocking async
+    // connect under a timeout (§11 perf): previously a sequential blocking
+    // `std::net::TcpStream::connect_timeout` stalled the whole async handler
+    // for up to `N * timeout` and parked a Tokio worker thread per probe.
+    let probes = [
         ("ruview-mcp-brain", 9876u16),
         ("cognitum-rvf-agent", 9004),
         ("ruvector-hailo-worker", 50051),
     ]
-    .iter()
+    .into_iter()
     .map(|(name, port)| {
-        let up = tcp_open("127.0.0.1", *port, st.cfg.timeout);
-        json!({ "name": name, "port": port, "status": if up { "running" } else { "unreachable" } })
-    })
-    .collect();
+        let timeout = st.cfg.timeout;
+        async move {
+            let up = tcp_open("127.0.0.1", port, timeout).await;
+            json!({ "name": name, "port": port, "status": if up { "running" } else { "unreachable" } })
+        }
+    });
+    let services: Vec<Value> = futures::future::join_all(probes).await;
     Json(json!({
         "cpu_pct": cpu,
         "ram_pct": ram,
@@ -453,13 +555,15 @@ fn cpu_load_pct() -> Option<f64> {
     Some(((load / ncpu * 100.0).min(100.0) * 10.0).round() / 10.0)
 }
 
-fn tcp_open(host: &str, port: u16, timeout: Duration) -> bool {
-    use std::net::ToSocketAddrs;
-    let addr = match (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
-        Some(a) => a,
-        None => return false,
-    };
-    std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
+/// Non-blocking liveness probe: succeeds iff a TCP connection to
+/// `host:port` completes within `timeout`. Async so it never parks a Tokio
+/// worker thread (unlike the blocking `std::net` connect it replaced).
+async fn tcp_open(host: &str, port: u16, timeout: Duration) -> bool {
+    let addr = format!("{host}:{port}");
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 #[cfg(test)]
@@ -565,7 +669,84 @@ mod tests {
         assert_eq!(ui["presence"]["value"], "occupied");
         assert_eq!(ui["breathing_bpm"]["value"], 12.0);
         assert!(ui["heart_bpm"].is_null(), "None heartbeat must map to null (not trained)");
-        assert_eq!(ui["anomaly"]["threshold"], 0.5);
+        // §6 invariant 3: upstream RoomState carries no threshold here, so the
+        // adapter must emit null (withheld) — NOT a fabricated constant.
+        assert!(
+            ui["anomaly"]["threshold"].is_null(),
+            "absent upstream threshold must surface as null, never a hardcoded value"
+        );
+    }
+
+    #[test]
+    fn adapt_room_state_passes_through_real_anomaly_threshold() {
+        // When the upstream RoomState DOES carry a real threshold, it must be
+        // forwarded verbatim (no fabrication, no override).
+        let cal = json!({
+            "anomaly": {"kind":"Anomaly","value":0.2,"confidence":0.5,"threshold":0.73},
+        });
+        let ui = adapt_room_state("bedroom_1", &cal);
+        assert_eq!(ui["anomaly"]["threshold"], 0.73, "real threshold must pass through");
+    }
+
+    #[test]
+    fn validate_proxy_path_allows_legit_v1_paths() {
+        // The only shape the UI sends must pass unchanged.
+        for ok in [
+            "v1/room/state",
+            "v1/calibration/baselines",
+            "v1/enroll/status",
+            "v1/room/state?bank=living_room", // query is split off before this fn
+        ] {
+            // strip any query the caller would have removed; we only validate path
+            let p = ok.split('?').next().unwrap();
+            assert!(validate_proxy_path(p).is_ok(), "{p} should be allowed");
+        }
+    }
+
+    #[test]
+    fn validate_proxy_path_rejects_traversal_variants() {
+        for bad in [
+            "v1/../../x",        // dot-segment traversal
+            "../etc/passwd",     // parent escape
+            "/etc/passwd",       // absolute
+            "v1\\..\\..\\x",     // backslash traversal
+            "..%2f..%2fx",       // encoded slash
+            "%2e%2e/x",          // encoded dot-dot
+            "v1/%2e%2e%2fadmin", // mixed encoded traversal
+            "%252e%252e/x",      // double-encoded (residual %2e after one decode)
+        ] {
+            assert!(validate_proxy_path(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn cal_proxy_rejects_traversal_with_400_before_upstream() {
+        // `gw()` has calibration_url=None: a path that reached URL-building
+        // would 503 ("not configured"). A 400 here proves the traversal is
+        // rejected BEFORE any upstream request is even attempted.
+        for (method, path) in [
+            ("GET", "/api/cal/v1/../../x"),
+            ("GET", "/api/cal/..%2f..%2fx"),
+            ("GET", "/api/cal/%2e%2e/x"),
+            ("POST", "/api/cal/v1/../../x"),
+        ] {
+            let (status, body) = send(gateway_router(gw()), method, path).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path} must be 400");
+            assert!(body.contains("bad_request"), "{method} {path} typed 400 body");
+            assert!(
+                !body.contains("upstream_unavailable"),
+                "{method} {path} must NOT reach the upstream-config branch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cal_proxy_allows_legit_path_through_to_upstream_config() {
+        // A legitimate v1 path passes validation and then hits the
+        // "not configured" 503 (proving it was NOT blocked as traversal).
+        let (status, body) = send(gateway_router(gw()), "GET", "/api/cal/v1/room/state").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("upstream_unavailable"), "legit path should reach upstream branch");
     }
 
     #[test]

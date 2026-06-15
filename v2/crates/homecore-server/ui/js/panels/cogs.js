@@ -39,8 +39,19 @@ export default {
     }
 
     // ── Hailo HEF status ───────────────────────────────────────────
+    // §6 honesty: the worker pill must reflect the REAL probe, not a
+    // hardcoded "connected". Probe the appliance services for the
+    // ruvector-hailo-worker; if that upstream is unavailable, show the
+    // status as unknown rather than fabricating "connected".
+    let workerStatus = 'unknown';
+    try {
+      const appliance = await api.appliance();
+      const svc = (appliance.services || []).find((s) => s.name === 'ruvector-hailo-worker');
+      if (svc && svc.status) workerStatus = svc.status;
+    } catch { /* leave 'unknown' — honest not-available, never fabricated */ }
+
     root.appendChild(h('h2.mt', 'Hailo-10H accelerator'));
-    root.appendChild(hailoStatus(cogs));
+    root.appendChild(hailoStatus(cogs, workerStatus));
 
     return () => {};
   },
@@ -107,7 +118,7 @@ function logText(c) {
   return [
     `[info]  ${c.id} v${c.version} running (pid ${c.pid})`,
     `[info]  arch=${c.arch} sha256_verified=${c.sha256_verified} signature_verified=${c.signature_verified}`,
-    c.arch === 'hailo10' ? `[info]  hailo: ${(c.hef || []).join(', ') || 'no HEF loaded'} @ ${c.throughput_fps || '—'} fps` : '[info]  cpu-only worker, no Hailo offload',
+    c.arch === 'hailo10' ? `[info]  hailo: ${asArray(c.hef).join(', ') || 'no HEF loaded'} @ ${c.throughput_fps || '—'} fps` : '[info]  cpu-only worker, no Hailo offload',
     '[info]  heartbeat ok',
   ].join('\n');
 }
@@ -120,10 +131,19 @@ function configJson(c) {
     autostart: c.status !== 'stopped',
   };
   if (c.arch === 'hailo10') {
-    cfg.hef = c.hef || [];
+    cfg.hef = asArray(c.hef);
     cfg.target_fps = c.throughput_fps || null;
   }
   return JSON.stringify(cfg, null, 2);
+}
+
+// Coerce a forwarded manifest `hef` (array | string | object | null) into an
+// array so a non-array value degrades gracefully instead of throwing on
+// .forEach/.join/.length (the gateway forwards it verbatim — §11).
+function asArray(v) {
+  if (Array.isArray(v)) return v;
+  if (v == null || v === '') return [];
+  return [v];
 }
 
 // ── OTA update diff card ─────────────────────────────────────────────
@@ -148,19 +168,22 @@ function diffList(title, items, color) {
 }
 
 // ── Hailo HEF status ─────────────────────────────────────────────────
-function hailoStatus(cogs) {
+function hailoStatus(cogs, workerStatus = 'unknown') {
   const hailoCogs = cogs.filter((c) => c.arch === 'hailo10');
-  const worker = h('.flex.gap-sm', statusPill('connected'), h('span.mono.t2', 'ruvector-hailo-worker:50051'));
+  // statusPill maps 'running'/'connected'→green, 'unreachable'/'error'→red,
+  // 'unknown'→grey; the real probe drives the colour, never a hardcode.
+  const worker = h('.flex.gap-sm', statusPill(workerStatus), h('span.mono.t2', 'ruvector-hailo-worker:50051'));
   const body = h('div', worker);
 
   if (!hailoCogs.length) {
     body.appendChild(h('.muted-empty', 'No Hailo-sourced COGs loaded.'));
   } else {
     hailoCogs.forEach((c) => {
+      const hef = asArray(c.hef); // gateway forwards manifest `hef` verbatim — may be a string
       const hefRows = h('div',
         h('.flex.spread', h('strong.mono', `${c.id} ${c.version}`), pill((c.throughput_fps || 0) + ' fps', 'purple')));
-      (c.hef || []).forEach((f) => hefRows.appendChild(h('.row', h('span.mono.purple', f), h('span.t2', 'loaded'))));
-      if (!(c.hef || []).length) hefRows.appendChild(h('.muted-empty', 'no .hef files loaded'));
+      hef.forEach((f) => hefRows.appendChild(h('.row', h('span.mono.purple', f), h('span.t2', 'loaded'))));
+      if (!hef.length) hefRows.appendChild(h('.muted-empty', 'no .hef files loaded'));
       body.appendChild(h('.mt', hefRows));
     });
   }

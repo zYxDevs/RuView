@@ -9,6 +9,14 @@ export default {
     const { api } = ctx;
     const cal = api.calibration;
     const state = { step: 1, room_id: '', seed: '', baseline_id: null, anchorIdx: 0, trainResult: null };
+    // Track the active baseline poll so it can be cancelled on Restart, on a
+    // step change, and when the panel itself is torn down (the router only
+    // calls the cleanup this render() returns — a per-card _cleanup was never
+    // invoked, leaking the setTimeout loop).
+    let activePoll = null;
+    function stopPoll() {
+      if (activePoll) { activePoll.cancelled = true; if (activePoll.timer) clearTimeout(activePoll.timer); activePoll = null; }
+    }
 
     root.appendChild(sectionHeader('Calibration Wizard', 'baseline → enroll → train → verify'));
     if (cal.demo) root.appendChild(banner('DEMO — cog-calibration HTTP API (ADR-151) simulated in-browser; the live service replaces this (§7.1).', 'amber'));
@@ -26,7 +34,7 @@ export default {
         stepper.appendChild(h('.step-pill' + (cls ? '.' + cls : ''), h('span.n', n < state.step ? '✓' : String(n)), s));
       });
     }
-    function go(step) { state.step = step; paintStepper(); render(); }
+    function go(step) { stopPoll(); state.step = step; paintStepper(); render(); }
     function render() {
       clear(body);
       if (state.step === 1) body.appendChild(step1());
@@ -74,35 +82,51 @@ export default {
       const c = card({
         title: 'Step 2 — Baseline capture (room must be empty)', children: [
           progress, meta, baselineLine,
-          h('.mt', button('Restart', { variant: 'ghost', onClick: () => { cal.reset(); poll.started = false; } })),
+          h('.mt', button('Restart', {
+            variant: 'ghost',
+            // Cancel the in-flight poll loop (was leaked before), reset the
+            // session, and start a fresh capture.
+            onClick: () => { stopPoll(); cal.reset(); clear(baselineLine); startCapture(); },
+          })),
         ],
       });
-      const poll = { started: false, timer: null };
-      (async () => {
-        let startRes;
-        try { startRes = await cal.start(); }
-        catch (e) { clear(meta); meta.appendChild(banner('Baseline start failed — ' + (e.message || e), 'red')); return; }
-        state.baseline_id = (startRes && startRes.baseline_id) || state.baseline_id;
-        const loop = async () => {
-          let st;
-          try { st = await cal.status(); }
-          catch (e) { clear(meta); meta.appendChild(banner('Status unavailable — ' + (e.message || e), 'red')); return; }
-          progress.firstChild.style.width = (st.frames / st.target * 100).toFixed(0) + '%';
-          clear(meta); meta.appendChild(document.createTextNode(`${st.frames}/${st.target} frames · ETA ${st.eta_s}s · z_median ${st.z_median}`));
-          if (st.motion_flagged) { if (!c.querySelector('.banner')) c.insertBefore(banner('Room must be empty — movement detected', 'amber'), progress); }
-          else { const b = c.querySelector('.banner'); if (b) b.remove(); }
-          if (st.frames >= st.target) {
-            state.baseline_id = state.baseline_id || 'bl-unknown';
-            clear(baselineLine);
-            baselineLine.appendChild(h('.mt', h('span.green', 'Baseline complete · '), mono(state.baseline_id), h('span.t2', ' (record this — it anchors STALE detection)')));
-            baselineLine.appendChild(h('.mt', button('Continue to enrollment', { variant: 'primary', onClick: () => go(3) })));
-            return;
-          }
-          poll.timer = setTimeout(loop, 600);
-        };
-        loop();
-      })();
-      c._cleanup = () => poll.timer && clearTimeout(poll.timer);
+
+      // Single-flight: stopPoll() before (re)arming guarantees one loop.
+      function startCapture() {
+        stopPoll();
+        const session = { cancelled: false, timer: null };
+        activePoll = session;
+        (async () => {
+          let startRes;
+          try { startRes = await cal.start(); }
+          catch (e) { clear(meta); meta.appendChild(banner('Baseline start failed — ' + (e.message || e), 'red')); return; }
+          if (session.cancelled) return;
+          state.baseline_id = (startRes && startRes.baseline_id) || state.baseline_id;
+          const loop = async () => {
+            if (session.cancelled) return;
+            let st;
+            try { st = await cal.status(); }
+            catch (e) { clear(meta); meta.appendChild(banner('Status unavailable — ' + (e.message || e), 'red')); return; }
+            if (session.cancelled) return;
+            progress.firstChild.style.width = pct(st.frames, st.target) + '%';
+            clear(meta); meta.appendChild(document.createTextNode(`${st.frames}/${st.target} frames · ETA ${st.eta_s}s · z_median ${st.z_median}`));
+            if (st.motion_flagged) { if (!c.querySelector('.banner')) c.insertBefore(banner('Room must be empty — movement detected', 'amber'), progress); }
+            else { const b = c.querySelector('.banner'); if (b) b.remove(); }
+            if (st.target > 0 && st.frames >= st.target) {
+              activePoll = null;
+              state.baseline_id = state.baseline_id || 'bl-unknown';
+              clear(baselineLine);
+              baselineLine.appendChild(h('.mt', h('span.green', 'Baseline complete · '), mono(state.baseline_id), h('span.t2', ' (record this — it anchors STALE detection)')));
+              baselineLine.appendChild(h('.mt', button('Continue to enrollment', { variant: 'primary', onClick: () => go(3) })));
+              return;
+            }
+            session.timer = setTimeout(loop, 600);
+          };
+          loop();
+        })();
+      }
+
+      startCapture();
       return c;
     }
 
@@ -206,9 +230,16 @@ export default {
 
     paintStepper();
     render();
-    return () => {};
+    // The router invokes this on navigation away — tear down any live poll.
+    return () => stopPoll();
   },
 };
+
+// Guard against NaN%/Infinity% when target is 0/missing (§4.7 robustness).
+function pct(frames, target) {
+  if (!(target > 0)) return 0;
+  return Math.max(0, Math.min(100, (frames / target) * 100)).toFixed(0);
+}
 
 function instruction(label) {
   const map = {

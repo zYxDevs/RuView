@@ -426,3 +426,19 @@ Staged so each wave is independently shippable behind the gateway, lands real da
 | **W6 — Appliance + federation + Hailo** | ◑ appliance host metrics from `/proc` + port probes DONE (live `/proc` data verified); Hailo stats + federation remain `503` (need the accelerator stat source / coordinator). |
 
 **Status:** the gateway is **compiled and tested on Rust 1.89** (`cargo test -p homecore-server` = 12/12) and was **run live** (curl proof in §10). The one remaining caveat is intrinsic, not an environment limit: **W3/W5/W6-Hailo/federation depend on services/hardware that are not in this repo** (recorder/automation HTTP wrappers, real SEED nodes, the Hailo stat source), so they return honest typed `503`s and the UI shows error states — exactly as §2.2/§11.2 prescribe. W1/W2/W4/W6-appliance are functional now.
+
+### 12.2 Security review (PR #1082)
+
+A high-effort public-PR review of the merged gateway + front-end surfaced the following, all fixed and pinned by tests (`cargo test -p homecore-server` is now **18/18**):
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | **HIGH** | **Path-traversal / confused-deputy SSRF** in the `/api/cal/*` reverse-proxy. The wildcard path was interpolated into the upstream URL while `proxy()` attaches the privileged server-side calibration bearer, so `/api/cal/v1/../../x` (or `..%2f`, `%2e%2e`, leading `/`, `\`, double-encoded `%252e`) could escape the `…/api/` scope **with the token**. | `validate_proxy_path()` decode-then-checks and rejects absolute / backslash / dot-segment / encoded-traversal paths with a typed **400 before the URL is built** (GET **and** POST); legit `v1/...` paths still pass. |
+| 2 | Correctness | **CORS + tracing didn't cover gateway routes** — `/api/homecore/*` + `/api/cal/*` were `.merge()`d outside `homecore-api::router()`'s layers. | The audited HC-05 `build_cors_layer()` + `TraceLayer` are now applied to the whole merged app in `main.rs`. |
+| 3 | Honesty (§6) | **Fabricated data** — hardcoded `anomaly.threshold: 0.5` in the adapter; dashboard rendered `"null%"`/`"null°C"`; COG Hailo pill hardcoded `"connected"`; `rooms.js` defaulted a null threshold to `0.8`. | Threshold passes through the real upstream value or emits `null` (withheld); dashboard renders `—`; the Hailo pill reflects the real appliance probe; the UI treats a null threshold as withheld. |
+| 4 | Robustness | A string `hef` (forwarded verbatim) threw on `.forEach`/`.join`; `frames/target` could be `NaN%`/`Infinity%`; calibration Restart leaked the baseline `setTimeout` poll. | `asArray()` coercion; `target > 0` guard; cancellable poll cleared on Restart / panel teardown. |
+| 5 | Perf | Sequential per-bank RoomState fetches; blocking `std::net::TcpStream::connect_timeout` probes on an async handler; `mock.js` statically bundled. | Concurrent `futures::join_all`; async `tokio::net::TcpStream` + `timeout`; demo-only dynamic `import()` of `mock.js`. |
+
+**Known limitations carried forward (not regressions):**
+- **`reqwest` rustls-only is a workspace-wide concern.** `homecore-server` opts into `rustls-tls` only, but cargo feature-unification means any sibling crate enabling the default `native-tls` re-introduces OpenSSL into the final binary. A true "no OpenSSL on the appliance" guarantee requires aligning **every** reqwest-pulling crate on rustls-only — out of scope for this PR; documented at the dependency in `Cargo.toml`.
+- **DEV-mode auth.** When `HOMECORE_TOKENS` is unset, the token store falls back to `allow_any_non_empty()` (any non-empty bearer accepted) on `0.0.0.0`. This is pre-existing and intentionally **unchanged** here; the loud boot `warn!` is retained. Provision real tokens (`HOMECORE_TOKENS=…`) before exposing the server to a network.

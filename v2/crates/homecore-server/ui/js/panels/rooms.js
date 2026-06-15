@@ -88,8 +88,17 @@ function vitalRow(label, spec, unit, range, r) {
 
 function anomalyRow(a) {
   if (!a) return specRow('Anomaly', notTrainedNode(), null);
-  const over = a.value > (a.threshold ?? 0.8);
-  const b = bar(a.value, 1, [{ lt: a.threshold ?? 0.8, color: 'green' }, { lt: 1.01, color: 'red' }]);
+  // §6 honesty: a null threshold is WITHHELD (the upstream RoomState carried
+  // none) — show the value but flag the threshold as unavailable rather than
+  // judging anomalous/normal against a fabricated 0.8 default.
+  if (a.threshold == null) {
+    const wrap = h('div', { style: { width: '160px' } },
+      bar(a.value, 1),
+      h('small.ts', { title: 'no anomaly threshold from upstream — withheld' }, `${a.value} · threshold —`));
+    return specRow('Anomaly', wrap, a);
+  }
+  const over = a.value > a.threshold;
+  const b = bar(a.value, 1, [{ lt: a.threshold, color: 'green' }, { lt: 1.01, color: 'red' }]);
   const wrap = h('div', { style: { width: '160px' } }, b,
     h('small.ts', over ? 'anomalous' : 'normal', ` · ${a.value}`));
   return specRow('Anomaly', wrap, a);
